@@ -18,6 +18,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Pass.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
@@ -67,7 +68,13 @@ namespace {
     bool checkFunctionCalls(const Function &F);
     bool mayBeOverridden(const Function &F);
 
-    void replaceCallSites(const Function &F);
+    void replaceCallSites(Function &F);
+
+    SmallVector<Argument*, 4> getArguments(const Function &F);
+    void getGlobalsByFunction(const Function &F, SmallPtrSetImpl<const GlobalVariable*> *globals);
+    SmallVector<Type::TypeID, 5> getPrototype(const Function &F);
+
+    size_t findIndex(SmallVectorImpl<Argument*> &args, Argument* target);
 
     size_t callStackDepth;
 
@@ -176,6 +183,81 @@ bool Memoize::checkFunctionCalls(const Function &F) {
   return true;
 }
 
-void replaceCallSites(const Function &F) {
-  
+void Memoize::replaceCallSites(Function &F) {
+  SmallPtrSet<const GlobalVariable*, 10> globals;
+  getGlobalsByFunction(F, &globals);
+
+  auto prototype = getPrototype(F);
+  SmallVector<Argument*, 6> newArgs;
+
+  std::sort(prototype.begin(), prototype.end());
+
+  const Twine newName("_memoized_" + F.getName());
+  Twine callString(newName);
+
+  // Replace each call site 
+  for (auto CS: F.users()) {
+    // Args must be sorted so that memoization is consistent
+    auto args = getArguments(F);
+
+    // Add globals
+    args.append(globals.begin(), globals.end()); // TODO: convert globals to arguments
+    newArgs.append(args.begin(), args.end());    
+    std::sort(newArgs.begin(), newArgs.begin());
+
+    for (Argument* x: newArgs) {
+      // TODO: figure out what isPresent check is for
+
+      // get index of each argument
+      size_t index = findIndex(newArgs, x);
+
+      // remove constants from call string
+      if (ConstantInt* c = dyn_cast<ConstantInt>(x)) {
+        prototype.erase(prototype.begin() + index);
+        newArgs.erase(newArgs.begin() + index);
+
+        SmallString<10> constantValString;
+        c->getValue().toString(constantValString, 10, true);
+        callString.concat(constantValString + ",)");
+      }
+    }
+
+    if (!F.users().empty()) {
+      // Create new function
+      Function *newFunction = Function::Create(
+        FunctionType::get(F.getReturnType(), false),
+        Function::LinkageTypes::ExternalLinkage,
+        newName,
+        *F.getParent()
+      );
+
+      // replace uses with
+      F.replaceAllUsesWith(newFunction);
+
+      // Print call string to file 
+      errs() << "Memoized Function: ";
+      errs() << callString << "\n";
+    }
+  }
+}
+
+SmallVector<Argument*, 4> Memoize::getArguments(const Function &F) {
+  SmallVector<Argument*, 4> args(F.args().begin(), F.args().end()); // TODO: delete this function and inline this code
+  return args;
+}
+
+void Memoize::getGlobalsByFunction(const Function &F, SmallPtrSetImpl<const GlobalVariable*> *globals) {
+  for (const BasicBlock &BB: F) 
+    for (const Instruction &I: BB) 
+      for (const Value *Op: I.operands())
+        if (const GlobalVariable* G = dyn_cast<GlobalVariable>(Op))
+          globals->insert(G);    
+}
+
+SmallVector<Type::TypeID, 5> Memoize::getPrototype(const Function &F) {
+  // TODO
+}
+
+size_t Memoize::findIndex(SmallVectorImpl<Argument*> &args, Argument* target) {
+  // TODO
 }
