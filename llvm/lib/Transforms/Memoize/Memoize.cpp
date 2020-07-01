@@ -48,10 +48,14 @@ namespace {
 
       // Do work
       for (Function &F: M.getFunctionList()) {
+        errs() << "Function: ";
+        errs().write_escaped(F.getName()) << '\n';
+
         if (isMemoizable(F)) {
           // make function memoizable
 
           // update all call sites 
+          replaceCallSites(F);
 
           // send meta data to if-memo
         }
@@ -70,11 +74,10 @@ namespace {
 
     void replaceCallSites(Function &F);
 
-    SmallVector<Argument*, 4> getArguments(const Function &F);
     void getGlobalsByFunction(const Function &F, SmallPtrSetImpl<const GlobalVariable*> *globals);
-    SmallVector<Type::TypeID, 5> getPrototype(const Function &F);
+    SmallVector<Type*, 5> getPrototype(const Function &F);
 
-    size_t findIndex(SmallVectorImpl<Argument*> &args, Argument* target);
+    size_t findIndex(SmallVectorImpl<Value*> &args, Value* target);
 
     size_t callStackDepth;
 
@@ -135,6 +138,10 @@ bool Memoize::isMemoizable(const Function &F) {
   return false;
 }
 
+bool Memoize::isMemoizableLib(const Function &F) {
+  return F.getName().contains("_memoized__");
+}
+
 bool Memoize::isMemoizablePointer(const Argument &A) {
   // check each use of A
   //   if any are load or store then not memoizable
@@ -187,63 +194,112 @@ void Memoize::replaceCallSites(Function &F) {
   SmallPtrSet<const GlobalVariable*, 10> globals;
   getGlobalsByFunction(F, &globals);
 
-  auto prototype = getPrototype(F);
-  SmallVector<Argument*, 6> newArgs;
+  SmallVector<Type*, 5> prototype = getPrototype(F);
+  std::sort(prototype.begin(), prototype.end(), [] (Type* a, Type* b) {
+    return a->getTypeID() < b->getTypeID();
+  });
 
-  std::sort(prototype.begin(), prototype.end());
+  SmallVector<const Value*, 10> args;
+  SmallVector<const Value*, 10> newArgs;
 
-  const Twine newName("_memoized_" + F.getName());
-  Twine callString(newName);
+  Twine callString = "_memoized__" + F.getName();
 
   // Replace each call site 
   for (auto CS: F.users()) {
-    // Args must be sorted so that memoization is consistent
-    auto args = getArguments(F);
+    CallInst* callSite = dyn_cast<CallInst>(CS);
+    if (!callSite) {
+      continue;
+    }
+    // TODO: UNIT tests
+    // TODO: intengration test + sanity checks
 
-    // Add globals
-    args.append(globals.begin(), globals.end()); // TODO: convert globals to arguments
-    newArgs.append(args.begin(), args.end());    
-    std::sort(newArgs.begin(), newArgs.begin());
+    for (const Use &U: callSite->data_ops()) {
+      args.push_back(U.get());
+    }
+    for (const GlobalVariable *GV: globals) {
+      args.push_back(GV);
+    }
 
-    for (Argument* x: newArgs) {
+    // 2. Sort arguments + globals
+    newArgs.append(args.begin(), args.end());
+    std::sort(newArgs.begin(), newArgs.begin(), [] (const Value* a, const Value* b) {
+      return a->getType()->getTypeID() < b->getType()->getTypeID(); // sort by type
+    });
+
+    // 3. Remove constants
+    for (const Value* x: args) {
       // TODO: figure out what isPresent check is for
 
       // get index of each argument
-      size_t index = findIndex(newArgs, x);
+      size_t index = std::distance(args.begin(),
+        std::find(args.begin(), args.end(), x)
+      );
 
       // remove constants from call string
-      if (ConstantInt* c = dyn_cast<ConstantInt>(x)) {
+      if (const ConstantInt* c = dyn_cast<ConstantInt>(x)) {
         prototype.erase(prototype.begin() + index);
-        newArgs.erase(newArgs.begin() + index);
+        args.erase(args.begin() + index);
 
         SmallString<10> constantValString;
         c->getValue().toString(constantValString, 10, true);
-        callString.concat(constantValString + ",)");
+        //callString.concat(constantValString + ",)");
       }
     }
 
     if (!F.users().empty()) {
-      // Create new function
+      // Call Site replacement procedure
+      // 1) Create args properly and make sure the actual and formal parameter types should be same.
+      //     If not add a cast.
+      // 2) Make sure the return types are same.
+      // 3) Set the calling conventions if any.
+      // 4) Replace use if any.
+      // 5) Then replace the instruction.
+
+      // I. Build function type from sorted arguments + return type
+      SmallVector<Type*, 5> signature;
+      for (const Value* &arg: args) {
+        signature.push_back(arg->getType());
+      }
+      FunctionType *functionType = FunctionType::get(
+        F.getReturnType(),
+        signature,
+        false
+      );
+
+      // II. Create new function
       Function *newFunction = Function::Create(
-        FunctionType::get(F.getReturnType(), false),
+        functionType,
         Function::LinkageTypes::ExternalLinkage,
-        newName,
+        "_memoized__" + F.getName(),
         *F.getParent()
       );
 
-      // replace uses with
+      // III. Assign argument names
+      size_t i = 0;
+      for (Argument &A: newFunction->args()) {
+        A.setName(args[i]->getName()); // TODO: fix up Twine/StringRef conversion
+        i++;
+      }
+      
+
+      // IV. replace uses with
       F.replaceAllUsesWith(newFunction);
 
-      // Print call string to file 
+      // V. Replace CallInst (maybe?)
+
+      // Print call string to file
       errs() << "Memoized Function: ";
-      errs() << callString << "\n";
+      errs() << "_memoized__" + F.getName() << "\n";
+
+      // clean up time
+      args.clear();
+      newArgs.clear();
     }
   }
 }
 
-SmallVector<Argument*, 4> Memoize::getArguments(const Function &F) {
-  SmallVector<Argument*, 4> args(F.args().begin(), F.args().end()); // TODO: delete this function and inline this code
-  return args;
+bool Memoize::mayBeOverridden(const Function &F) {
+  return false; // TODO: add real implementation for this
 }
 
 void Memoize::getGlobalsByFunction(const Function &F, SmallPtrSetImpl<const GlobalVariable*> *globals) {
@@ -254,10 +310,10 @@ void Memoize::getGlobalsByFunction(const Function &F, SmallPtrSetImpl<const Glob
           globals->insert(G);    
 }
 
-SmallVector<Type::TypeID, 5> Memoize::getPrototype(const Function &F) {
-  // TODO
-}
-
-size_t Memoize::findIndex(SmallVectorImpl<Argument*> &args, Argument* target) {
-  // TODO
+SmallVector<Type*, 5> Memoize::getPrototype(const Function &F) {
+  SmallVector<Type*,5> types;
+  for (const Argument &A: F.args()) {
+    types.push_back(A.getType());
+  }
+  return types;
 }
