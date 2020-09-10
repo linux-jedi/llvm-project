@@ -73,8 +73,9 @@ namespace {
     bool mayBeOverridden(const Function &F);
 
     void replaceCallSites(Function &F);
+    void unsafeReplaceFunctionUses(Function &F, Function &New);
 
-    void getGlobalsByFunction(const Function &F, SmallPtrSetImpl<const GlobalVariable*> *globals);
+    void getGlobalsByFunction(const Function &F, SmallPtrSetImpl<GlobalVariable*> *globals);
     SmallVector<Type*, 5> getPrototype(const Function &F);
 
     size_t findIndex(SmallVectorImpl<Value*> &args, Value* target);
@@ -132,7 +133,12 @@ bool Memoize::isMemoizable(const Function &F) {
     return true;
 
   callStackDepth = 0;
-  if (isProperArguments(F) && isGlobalSafe(F) && checkFunctionCalls(F))
+  // gaussian fails here
+  bool properArgs = isProperArguments(F);
+  bool globalSafe = isGlobalSafe(F);
+  bool functionCheck = checkFunctionCalls(F);
+
+  if (properArgs && globalSafe && functionCheck)
     return true;
 
   return false;
@@ -180,18 +186,41 @@ bool Memoize::checkFunctionCalls(const Function &F) {
       }
       
       callStackDepth++;
-      if (callStackDepth >= MAX_DEPTH) return false;
+      if (callStackDepth >= MAX_DEPTH) {
+        errs() << "Stack Depth Exceeded: ";
+        errs().write_escaped(F.getName()) << "\n";
+        return false;
+      } 
 
       if (isMemoizable(*calledFunction)) continue;
 
+      errs() << "Called Function not memoizable: ";
+      errs().write_escaped(calledFunction->getName()) << '\n';
+      errs().write_escaped(calledFunction->getParent()->getName()) << '\n';
       return false;
     }
   }
   return true;
 }
 
+// This function is used to *UNSAFELY* replace all the uses of F with
+// New. This is necessary because Value::replaceAllUsesWith() does not 
+// allow replacing functions with a function of different type.
+void Memoize::unsafeReplaceFunctionUses(Function &F, Function &New) {
+
+}
+
+
+// This function takes a memoizable function and replaces each of its calls
+// with a call to the memoized version of the function.
+// 
+// For each call site:
+//  1. Sort list of arguments and globals used by function
+//  2. Detect and remove constants that are args/globals
+//  3. Create new memoized function signature
+//  4. Replace call instruction with call to memoized function
 void Memoize::replaceCallSites(Function &F) {
-  SmallPtrSet<const GlobalVariable*, 10> globals;
+  SmallPtrSet<GlobalVariable*, 10> globals;
   getGlobalsByFunction(F, &globals);
 
   SmallVector<Type*, 5> prototype = getPrototype(F);
@@ -199,8 +228,8 @@ void Memoize::replaceCallSites(Function &F) {
     return a->getTypeID() < b->getTypeID();
   });
 
-  SmallVector<const Value*, 10> args;
-  SmallVector<const Value*, 10> newArgs;
+  SmallVector<Value*, 10> args;
+  SmallVector<Value*, 10> newArgs;
 
   Twine callString = "_memoized__" + F.getName();
 
@@ -210,13 +239,11 @@ void Memoize::replaceCallSites(Function &F) {
     if (!callSite) {
       continue;
     }
-    // TODO: UNIT tests
-    // TODO: intengration test + sanity checks
 
     for (const Use &U: callSite->data_ops()) {
       args.push_back(U.get());
     }
-    for (const GlobalVariable *GV: globals) {
+    for (GlobalVariable *GV: globals) {
       args.push_back(GV);
     }
 
@@ -231,14 +258,14 @@ void Memoize::replaceCallSites(Function &F) {
       // TODO: figure out what isPresent check is for
 
       // get index of each argument
-      size_t index = std::distance(args.begin(),
-        std::find(args.begin(), args.end(), x)
+      size_t index = std::distance(newArgs.begin(),
+        std::find(newArgs.begin(), newArgs.end(), x)
       );
 
       // remove constants from call string
       if (const ConstantInt* c = dyn_cast<ConstantInt>(x)) {
         prototype.erase(prototype.begin() + index);
-        args.erase(args.begin() + index);
+        newArgs.erase(newArgs.begin() + index);
 
         SmallString<10> constantValString;
         c->getValue().toString(constantValString, 10, true);
@@ -247,6 +274,8 @@ void Memoize::replaceCallSites(Function &F) {
     }
 
     if (!F.users().empty()) {
+      // Create New Function
+
       // Call Site replacement procedure
       // 1) Create args properly and make sure the actual and formal parameter types should be same.
       //     If not add a cast.
@@ -257,7 +286,7 @@ void Memoize::replaceCallSites(Function &F) {
 
       // I. Build function type from sorted arguments + return type
       SmallVector<Type*, 5> signature;
-      for (const Value* &arg: args) {
+      for (Value* arg: newArgs) {
         signature.push_back(arg->getType());
       }
       FunctionType *functionType = FunctionType::get(
@@ -265,6 +294,12 @@ void Memoize::replaceCallSites(Function &F) {
         signature,
         false
       );
+
+      // Debugging
+      errs() << "OG Function Type: ";
+      F.getFunctionType()->dump();
+      F.getType()->dump();
+      errs() << "\n";
 
       // II. Create new function
       Function *newFunction = Function::Create(
@@ -274,18 +309,33 @@ void Memoize::replaceCallSites(Function &F) {
         *F.getParent()
       );
 
+      errs() << "New Function Type: ";
+      functionType->dump();
+      newFunction->getType()->dump();
+      errs() << "\n";
+
       // III. Assign argument names
       size_t i = 0;
       for (Argument &A: newFunction->args()) {
-        A.setName(args[i]->getName()); // TODO: fix up Twine/StringRef conversion
+        A.setName(args[i]->getName());
         i++;
       }
       
+      // Update Call Site
+      // 1. Create new call inst that calls newFunction
+      // 2. Add necessary args from og call to new CallInst
+      // 3. Replace all uses of old call site with new CallInst
+      CallInst *NewCall = CallInst::Create(
+        functionType,
+        newFunction,
+        newArgs,
+        "memoized",
+        callSite
+      );
 
       // IV. replace uses with
-      F.replaceAllUsesWith(newFunction);
-
-      // V. Replace CallInst (maybe?)
+      callSite->replaceAllUsesWith(NewCall);
+      callSite->eraseFromParent();
 
       // Print call string to file
       errs() << "Memoized Function: ";
@@ -302,11 +352,11 @@ bool Memoize::mayBeOverridden(const Function &F) {
   return false; // TODO: add real implementation for this
 }
 
-void Memoize::getGlobalsByFunction(const Function &F, SmallPtrSetImpl<const GlobalVariable*> *globals) {
+void Memoize::getGlobalsByFunction(const Function &F, SmallPtrSetImpl<GlobalVariable*> *globals) {
   for (const BasicBlock &BB: F) 
     for (const Instruction &I: BB) 
-      for (const Value *Op: I.operands())
-        if (const GlobalVariable* G = dyn_cast<GlobalVariable>(Op))
+      for (Value *Op: I.operands())
+        if (GlobalVariable* G = dyn_cast<GlobalVariable>(Op))
           globals->insert(G);    
 }
 
